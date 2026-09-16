@@ -1,0 +1,335 @@
+#!/bin/zsh
+#
+# branchnew — split the current terminal to the right and continue the current
+# AGENT session there as an independent FORK, so you get a second view with the
+# same context right next to where you're working. Your current pane is left
+# untouched.
+#
+# Supports Claude Code and Grok CLI. The running agent is detected from the
+# process ancestor chain — first match wins walking up, so a grok nested inside
+# a claude session correctly resolves to grok. Falls back to the agents' own env
+# markers (GROK_SESSION_ID / CLAUDE_CODE_SESSION_ID) if the walk finds nothing.
+#
+# Usage:
+#   branchnew            split right + fork, auto-named newBranch1, newBranch2, …
+#   branchnew <name>     split right + fork, named <name> (verbatim, no number)
+#   branchnew --help     show help
+#   branchnew --record   (internal) record this pane's iTerm-guid ↔ session map for
+#                        the hotkey fork daemon; called by Claude hooks, not by you.
+#
+# Backend is auto-detected: tmux (real split) > iTerm2 (native split) >
+# Warp (split via System Events) > Apple Terminal (can't split → new window) >
+# anything else (new Terminal window).
+#
+# Claude Code: the fork's name is set with `claude --name`, shown in the new
+# session's prompt box, /resume picker, and terminal title.
+#
+# Grok CLI: has no `--name` equivalent — its `--session-id` only accepts a UUID.
+# A grok fork therefore just starts unnamed; `/rename` inside the pane sets a
+# title whenever you actually want one.
+#
+# The auto counter is stored in ${XDG_STATE_HOME:-~/.local/state}/branchnew/counter.
+#
+# Run it from the directory your agent session is in: it forks the most recent
+# session in $PWD.
+
+emulate -L zsh
+
+# ── Internal: `branchnew --record` (merged from the former standalone
+# branchnew-record). Called by Claude SessionStart / UserPromptSubmit hooks to
+# remember which Claude session lives in which iTerm pane, so the iTerm hotkey
+# daemon (iterm2/claude_fork.py) can fork the exact session in a pane. Not for
+# interactive use — see HOTKEY-FORK.md. Writes two lines (session id, cwd) to
+# ${XDG_STATE_HOME:-~/.local/state}/branchnew/iterm/<iterm-guid>.
+if [[ "${1:-}" == "--record" ]]; then
+  state="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
+  dir="$state/iterm"
+  mkdir -p "$dir" 2>/dev/null
+
+  # iTerm pane GUID = the part after ':' in $ITERM_SESSION_ID; it equals what the
+  # iTerm2 Python API reports as session.session_id.
+  src="${ITERM_SESSION_ID:-${TERM_SESSION_ID:-}}"
+  guid="${src##*:}"
+
+  # Hook JSON (session_id / cwd / hook_event_name / transcript_path) on stdin.
+  json_sid="" cwd="" event="" tpath=""
+  if [[ ! -t 0 ]]; then
+    json="$(cat 2>/dev/null)"
+    if [[ -n "$json" ]]; then
+      PY="$(command -v python3 || print -- /usr/bin/python3)"
+      parsed="$(print -r -- "$json" | "$PY" -c 'import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get("session_id", ""))
+    print(d.get("cwd", ""))
+    print(d.get("hook_event_name", ""))
+    print(d.get("transcript_path", ""))
+except Exception:
+    print(); print(); print(); print()' 2>/dev/null)"
+      lines=("${(@f)parsed}")
+      json_sid="${lines[1]:-}"; cwd="${lines[2]:-}"; event="${lines[3]:-}"; tpath="${lines[4]:-}"
+    fi
+  fi
+
+  # Prefer the transcript-derived id (the real .jsonl in use) so a fork resolves
+  # to the FORK's own id; then the live env id; then the JSON session_id.
+  tid=""
+  [[ -n "$tpath" ]] && tid="${tpath:t:r}"
+  sid="${tid:-${CLAUDE_CODE_SESSION_ID:-$json_sid}}"
+  [[ -n "$cwd" ]] || cwd="${PWD:-}"
+
+  print -r -- "$(date '+%F %T') event=${event:-?} json_sid=${json_sid:-NONE} tid=${tid:-NONE} env_sid=${CLAUDE_CODE_SESSION_ID:-NONE} guid=${guid:-NONE}" >> "$state/record.log" 2>/dev/null
+
+  [[ -n "$guid" && -n "$sid" ]] || exit 0
+  { print -r -- "$sid"; print -r -- "$cwd"; } > "$dir/$guid"
+  exit 0
+fi
+
+# ── Args: --help → help; one-or-more args → that name; no args → auto name. ────
+case "${1:-}" in
+  -h|--help|help)
+    print -r -- "Usage:"
+    print -r -- "  branchnew            split right + fork the current agent session,"
+    print -r -- "                       auto-named newBranch1, newBranch2, … (a counter)"
+    print -r -- "  branchnew <name>     same, but name the new session <name>"
+    print -r -- "  branchnew --help     show this help"
+    print -r -- ""
+    print -r -- "Agent auto-detected: Claude Code or Grok CLI (from the process chain)."
+    print -r -- "  Claude Code — the name is applied with \`claude --name\`."
+    print -r -- "  Grok CLI    — no --name equivalent; the fork starts unnamed."
+    print -r -- ""
+    print -r -- "Backend auto-detected: tmux > iTerm2 > Warp > Apple Terminal > new Terminal window."
+    exit 0
+    ;;
+esac
+
+if (( $# > 0 )); then
+  # Custom name: everything you typed (so multi-word names work without quotes).
+  name="$*"
+else
+  # Auto name: newBranch<N>, N from a global, persistent, incrementing counter.
+  state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/branchnew"
+  mkdir -p "$state_dir" 2>/dev/null
+  counter_file="$state_dir/counter"
+  cur="$(cat "$counter_file" 2>/dev/null)"
+  [[ "$cur" == <-> ]] || cur=0                 # reset if missing / non-numeric
+  n=$(( cur + 1 ))
+  print -r -- "$n" > "$counter_file" 2>/dev/null
+  name="newBranch${n}"
+fi
+
+print -u2 -r -- "branchnew: new branch session → ${name}"
+
+# ── Which agent is this session? ────────────────────────────────────────────
+# Walk the process ancestor chain and take the FIRST agent we hit. Walking up
+# means the nearest ancestor wins, which is what we want when one agent is
+# nested inside another — a grok launched from a claude session inherits
+# CLAUDE_CODE_* into its shell, so env vars alone would misidentify it.
+detect_agent() {
+  local pid=$$ comm exe i=0
+  while (( i < 12 )); do
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+    [[ -z "$pid" || "$pid" == "0" || "$pid" == "1" ]] && break
+    comm="$(ps -o command= -p "$pid" 2>/dev/null)"
+    # Match the EXECUTABLE NAME only, never the whole command line: an ancestor
+    # shell's argv can contain the literal word "grok" or "claude" (e.g. a bash
+    # -c script that happens to invoke one), which would be a false positive.
+    exe="${comm%% *}"
+    exe="${exe:t}"
+    case "$exe" in
+      grok|xai-grok-pager|grok-*) print -r -- grok;   return ;;
+      claude|claude-*)            print -r -- claude; return ;;
+    esac
+    (( i++ ))
+  done
+  # Fall back to the agents' own session markers. GROK_SESSION_ID is injected
+  # only by grok, CLAUDE_CODE_SESSION_ID only by Claude Code. Check grok first:
+  # a claude running inside grok's shell would carry both.
+  [[ -n "${GROK_SESSION_ID:-}" ]] && { print -r -- grok; return }
+  [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]] && { print -r -- claude; return }
+  print -r -- ""
+}
+
+agent="$(detect_agent)"
+[[ -n "$agent" ]] || agent=claude   # unrecognised → keep the pre-existing behaviour
+
+# The CLI command that launches the fork. Resolved in order:
+#   1. BRANCHNEW_<AGENT>_CMD env var
+#   2. ~/.config/branchnew/<agent>-cmd file (one line, e.g. "mc --code --dangerously-skip-permissions")
+#   3. ~/.config/branchnew/cmd (legacy, claude only)
+#   4. the agent's own binary
+_cfg_dir="${XDG_CONFIG_HOME:-$HOME/.config}/branchnew"
+if [[ "$agent" == grok ]]; then
+  if [[ -n "${BRANCHNEW_GROK_CMD:-}" ]]; then
+    agent_cmd="$BRANCHNEW_GROK_CMD"
+  elif [[ -r "$_cfg_dir/grok-cmd" ]]; then
+    agent_cmd="$(<$_cfg_dir/grok-cmd)"
+  else
+    agent_cmd="grok"
+  fi
+else
+  if [[ -n "${BRANCHNEW_CLAUDE_CMD:-}" ]]; then
+    agent_cmd="$BRANCHNEW_CLAUDE_CMD"
+  elif [[ -r "$_cfg_dir/cmd" ]]; then
+    agent_cmd="$(<$_cfg_dir/cmd)"
+  else
+    agent_cmd="claude"
+  fi
+fi
+
+# Command the new pane will run. ${(q)...} keeps paths / names with spaces safe.
+if [[ "$agent" == grok ]]; then
+  # Grok has no `--name` — its --session-id only accepts a UUID — so a grok fork
+  # simply starts unnamed. Not worth compensating for: /rename inside the pane
+  # gives it a title whenever you actually want one.
+  if [[ -n "${GROK_SESSION_ID:-}" ]]; then
+    # Don't cd before --resume: grok keys sessions by working directory, so we
+    # must resume from the ORIGINAL cwd. The fork inherits it automatically.
+    cmd="${agent_cmd} --resume ${(q)GROK_SESSION_ID} --fork-session"
+  else
+    cmd="cd ${(q)PWD} && ${agent_cmd} --continue --fork-session"
+  fi
+else
+  if [[ -n "${CLAUDE_CODE_SESSION_ID:-}" ]]; then
+    # Don't cd before --resume: Claude Code resolves the session file based on cwd,
+    # so we must resume from the ORIGINAL cwd where the session was created.
+    # The forked session inherits the parent's working directory automatically.
+    cmd="${agent_cmd} --resume ${(q)CLAUDE_CODE_SESSION_ID} --fork-session --name ${(q)name}"
+  else
+    cmd="cd ${(q)PWD} && ${agent_cmd} --continue --fork-session --name ${(q)name}"
+  fi
+fi
+
+# Debug aid: BRANCHNEW_DRYRUN=1 prints what would run and opens nothing.
+if [[ -n "${BRANCHNEW_DRYRUN:-}" ]]; then
+  print -r -- "[dry-run] TMUX=${TMUX:+set} TERM_PROGRAM=${TERM_PROGRAM:-unknown}"
+  print -r -- "[dry-run] agent: ${agent}"
+  print -r -- "[dry-run] command: $cmd"
+  exit 0
+fi
+
+# ── Backends — always a split to the right, or the closest each one can do. ────
+launch_tmux() {
+  tmux split-window -h -c "$PWD" || return 1
+  # -l sends the text literally (no key-name lookup), so a command containing
+  # e.g. ";" or spaces can't be mangled. Previously this hardcoded a claude
+  # command and silently ignored $cmd — wrong session, wrong agent, and the
+  # ~/.config/branchnew/cmd override never applied.
+  tmux send-keys -l "$cmd" || return 1
+  tmux send-keys Enter
+}
+
+launch_iterm() {
+  osascript \
+    -e 'on run argv' \
+    -e 'set cmd to item 1 of argv' \
+    -e 'tell application "iTerm"' \
+    -e '  activate' \
+    -e '  tell current session of current window to set s to (split vertically with default profile)' \
+    -e '  tell s to write text cmd' \
+    -e 'end tell' \
+    -e 'end run' \
+    "$cmd" 2>&1 >/dev/null
+}
+
+# Warp is not AppleScript-scriptable (no sdef) and has no CLI, URI or launch
+# hook that splits the CURRENT pane: the only way is CMD-D, then get the command
+# into the new pane. Warp's input box ignores synthetic *text* keystrokes, so
+# the command goes in through the clipboard (CMD-V), which Warp does honor.
+#
+# Synthetic keys are delivered to the FRONTMOST app, so every step is guarded:
+# nothing is sent until Warp actually owns the keyboard, and nothing is pasted
+# until the new pane's own shell exists. If either check fails we abort instead
+# of spraying keystrokes into whatever the user has in front.
+launch_warp() {
+  local srv
+  srv="$(ps -eo pid=,command= | awk '/Warp\.app\/Contents\/MacOS\/stable terminal-server/ {print $1; exit}')"
+  [[ -n "$srv" ]] || return 1
+
+  local before; before="$(pgrep -P "$srv" 2>/dev/null | sort)"
+
+  # 1. Raise Warp, then confirm it is really frontmost before touching the keyboard.
+  osascript -e 'tell application "Warp" to activate' >/dev/null 2>&1
+  local frontmost="" i
+  for i in {1..20}; do
+    frontmost="$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true' 2>/dev/null)"
+    [[ "$frontmost" == stable || "$frontmost" == Warp ]] && break
+    sleep 0.25
+  done
+  [[ "$frontmost" == stable || "$frontmost" == Warp ]] || return 1
+
+  # 2. Split the current pane: CMD-D splits to the right.
+  osascript -e 'tell application "System Events" to tell process "Warp" to keystroke "d" using {command down}' >/dev/null 2>&1 || return 1
+
+  # 3. Wait for the new pane's shell to exist, so the paste cannot fall back into
+  #    the current pane (or anywhere else) if the split did not happen.
+  local new="" p
+  for i in {1..40}; do
+    sleep 0.25
+    for p in $(pgrep -P "$srv" 2>/dev/null); do
+      grep -qx "$p" <<< "$before" || { new="$p"; break 2 }
+    done
+  done
+  [[ -n "$new" ]] || return 1
+  sleep 1
+
+  # 4. Paste the command into the new pane and run it. cd first: the pane must be
+  #    in the session's directory for the agent to resolve the session by ID.
+  local clip; clip="$(pbpaste 2>/dev/null)"
+  printf '%s' "cd ${(q)PWD} && $cmd" | pbcopy
+  osascript -e 'tell application "System Events" to tell process "Warp" to keystroke "v" using {command down}' >/dev/null 2>&1
+  sleep 0.5
+  osascript -e 'tell application "System Events" to tell process "Warp" to key code 36' >/dev/null 2>&1
+
+  # 5. Give Warp a moment to consume the clipboard, then put the user's back.
+  { sleep 3; printf '%s' "$clip" | pbcopy } &!
+  return 0
+}
+
+launch_terminal_window() {
+  osascript \
+    -e 'on run argv' \
+    -e 'set cmd to item 1 of argv' \
+    -e 'tell application "Terminal"' \
+    -e '  activate' \
+    -e '  do script cmd' \
+    -e 'end tell' \
+    -e 'end run' \
+    "$cmd" 2>&1 >/dev/null
+}
+
+fail() {
+  print -u2 -r -- "branchnew: could not open the new view."
+  [[ -n "${1:-}" ]] && print -u2 -r -- "$1"
+  print -u2 -r -- "(Is your terminal allowed to run AppleScript? System Settings ›"
+  print -u2 -r -- " Privacy & Security › Automation.)"
+  exit 1
+}
+
+# tmux first: if we're inside tmux it can split natively, whatever the terminal.
+if [[ -n "${TMUX:-}" ]]; then
+  launch_tmux || fail "tmux refused to split the window."
+  exit 0
+fi
+
+case "${TERM_PROGRAM:-}" in
+  iTerm.app)
+    if ! err="$(launch_iterm)"; then fail "$err"; fi
+    ;;
+  WarpTerminal)
+    if ! err="$(launch_warp)"; then fail "$err"; fi
+    ;;
+  Apple_Terminal)
+    print -u2 -r -- "branchnew: Apple Terminal can't split panes — opening a new window instead."
+    print -u2 -r -- "          (run inside tmux, or use iTerm2, for a real split.)"
+    if ! err="$(launch_terminal_window)"; then fail "$err"; fi
+    ;;
+  *)
+    print -u2 -r -- "branchnew: terminal '${TERM_PROGRAM:-unknown}' can't be scripted directly —"
+    print -u2 -r -- "          opening a new Apple Terminal window. For an in-place split, run"
+    print -u2 -r -- "          branchnew inside tmux, iTerm2, or Warp."
+    if ! err="$(launch_terminal_window)"; then fail "$err"; fi
+    ;;
+esac
+
+exit 0
